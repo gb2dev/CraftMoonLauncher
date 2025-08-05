@@ -1,0 +1,12 @@
+export component AppWindow inherits Window {
+    in-out property <string> status-text;
+    default-font-size: 24px;
+    title: @tr("CraftMoon Launcher");
+    min-width: 640px;
+    min-height: 360px;
+    max-width: self.min-width;
+    max-height: self.min-height;
+    Text {
+        text: root.status-text;
+    }
+}
