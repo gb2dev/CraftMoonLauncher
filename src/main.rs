@@ -10,11 +10,20 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use slint::Weak;
-use windows::Win32::UI::Shell::{FOLDERID_UserProgramFiles, SHGetKnownFolderPath};
 
 slint::include_modules!();
 
 const USER_AGENT_VALUE: &str = "crafmoon-launcher";
+const LAUNCHER_EXECUTABLE_NAME: &str = if cfg!(windows) {
+    "craftmoon-launcher.exe"
+} else {
+    "craftmoon-launcher-linux"
+};
+const GAME_EXECUTABLE_NAME: &str = if cfg!(windows) {
+    "CraftMoon.exe"
+} else {
+    "CraftMoon-linux"
+};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -74,10 +83,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    let programs_path_pwstr =
-        unsafe { SHGetKnownFolderPath(&FOLDERID_UserProgramFiles, Default::default(), None) }?;
-    let programs_path_str = unsafe { programs_path_pwstr.to_string() }? + "\\CraftMoon";
-    std::fs::create_dir_all(&programs_path_str)?;
+    let install_dir = install_dir()?;
+    std::fs::create_dir_all(&install_dir)?;
 
     let ui = AppWindow::new()?;
 
@@ -92,34 +99,55 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        let exe_path_str = programs_path_str + "\\CraftMoon.exe";
+        let game_path = install_dir.join(GAME_EXECUTABLE_NAME);
 
         if !args.no_game_update {
             let client = reqwest::blocking::Client::builder()
                 .timeout(None)
                 .build()
                 .unwrap();
-            let exe_file = std::fs::read(&exe_path_str)
-                .inspect_err(|err| eprintln!("Failed to read exe file: {err}"))
+            let exe_file = std::fs::read(&game_path)
+                .inspect_err(|err| eprintln!("Failed to read game executable: {err}"))
                 .ok();
             let exe_hash = if let Some(exe_file) = exe_file {
-                Some(format!("sha256:{:x}", Sha256::digest(exe_file)))
+                Some(format!("sha256:{}", hex_digest(Sha256::digest(exe_file))))
             } else {
                 None
             };
             let (releases, is_running_latest) =
                 check_for_updated_release(&client, &ui_weak, "CraftMoon", false, &exe_hash);
             if !is_running_latest {
-                update_game(&client, &ui_weak, releases, &exe_path_str, exe_hash);
+                update_game(&client, &ui_weak, releases, &game_path, exe_hash);
             }
         }
 
-        launch_game(&exe_path_str);
+        if game_path.exists() {
+            launch_game(&game_path);
+        } else {
+            set_status(
+                &ui_weak,
+                "No CraftMoon build is installed for this platform.",
+            );
+        }
     });
 
     ui.run()?;
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn install_dir() -> Result<PathBuf, Box<dyn Error>> {
+    dirs::data_local_dir()
+        .map(|data_dir| data_dir.join("CraftMoon"))
+        .ok_or_else(|| "failed to find local user data directory".into())
+}
+
+#[cfg(not(windows))]
+fn install_dir() -> Result<PathBuf, Box<dyn Error>> {
+    dirs::data_dir()
+        .map(|data_dir| data_dir.join("CraftMoon"))
+        .ok_or_else(|| "failed to find user data directory".into())
 }
 
 fn update_launcher(
@@ -130,9 +158,9 @@ fn update_launcher(
     let Some(exe_asset) = release
         .assets
         .iter()
-        .find(|&asset| asset.name.ends_with(".exe"))
+        .find(|&asset| is_platform_executable_asset(asset, LAUNCHER_EXECUTABLE_NAME))
     else {
-        eprintln!("No exe release asset found");
+        eprintln!("No launcher release asset found for this platform");
         return;
     };
 
@@ -163,6 +191,11 @@ fn update_launcher(
         return;
     }
 
+    if let Err(err) = make_executable(&destination) {
+        eprintln!("Failed to mark CraftMoonLauncher update executable: {err}");
+        return;
+    }
+
     if let Err(err) = self_replace::self_replace(&destination) {
         eprintln!("Failed to replace current exe: {err}");
         return;
@@ -180,14 +213,14 @@ fn update_game(
     client: &reqwest::blocking::Client,
     ui_weak: &Weak<AppWindow>,
     releases: Vec<Release>,
-    exe_path_str: &str,
+    game_path: &Path,
     exe_hash: Option<String>,
 ) {
     let installed_release_index = releases.iter().position(|release| {
         release
             .assets
             .iter()
-            .find(|&asset| asset.name.ends_with(".exe"))
+            .find(|&asset| is_platform_executable_asset(asset, GAME_EXECUTABLE_NAME))
             .is_some_and(|asset| asset.digest == exe_hash)
     });
 
@@ -202,7 +235,7 @@ fn update_game(
                 release
                     .assets
                     .iter()
-                    .find(|&asset| asset.name.ends_with(".patch"))
+                    .find(|&asset| is_platform_patch_asset(asset))
             })
             .collect();
 
@@ -234,7 +267,7 @@ fn update_game(
                 break;
             }
 
-            if let Err(err) = patch_file(exe_path_str, &destination) {
+            if let Err(err) = patch_file(game_path, &destination) {
                 eprintln!("Failed to update CraftMoon: {err}");
                 reinstall_game = true;
                 break;
@@ -258,16 +291,77 @@ fn update_game(
         let Some(exe_asset) = latest_release
             .assets
             .iter()
-            .find(|&asset| asset.name.ends_with(".exe"))
+            .find(|&asset| is_platform_executable_asset(asset, GAME_EXECUTABLE_NAME))
         else {
-            eprintln!("No exe release asset found");
+            let message = "No game release asset found for this platform";
+            eprintln!("{message}");
+            set_status(ui_weak, message);
             return;
         };
-        if let Err(err) = download_file(client, &exe_asset.browser_download_url, exe_path_str) {
+        if let Err(err) = download_file(client, &exe_asset.browser_download_url, game_path) {
             eprintln!("Failed to download CraftMoon: {err}");
             return;
         }
+        if let Err(err) = make_executable(game_path) {
+            eprintln!("Failed to mark CraftMoon executable: {err}");
+            return;
+        }
     }
+}
+
+fn is_platform_executable_asset(asset: &Asset, executable_name: &str) -> bool {
+    asset.name == executable_name
+}
+
+fn is_platform_patch_asset(asset: &Asset) -> bool {
+    let lower_name = asset.name.to_ascii_lowercase();
+    if !lower_name.ends_with(".patch") {
+        return false;
+    }
+
+    if cfg!(windows) {
+        return !lower_name.contains("linux")
+            && !lower_name.contains("macos")
+            && !lower_name.contains("darwin");
+    }
+
+    lower_name.contains("linux")
+}
+
+fn make_executable(path: impl AsRef<Path>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = path.as_ref();
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        std::fs::set_permissions(path, permissions)?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+fn hex_digest(digest: impl AsRef<[u8]>) -> String {
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn set_status(ui_weak: &Weak<AppWindow>, message: impl Into<slint::SharedString>) {
+    let message = message.into();
+    ui_weak
+        .upgrade_in_event_loop(move |ui| {
+            ui.set_status_text(message);
+        })
+        .unwrap();
 }
 
 fn download_file(
@@ -329,7 +423,7 @@ fn check_for_updated_release(
         latest_release
             .assets
             .iter()
-            .find(|&asset| asset.name.ends_with(".exe"))
+            .find(|&asset| is_platform_executable_asset(asset, GAME_EXECUTABLE_NAME))
             .is_some_and(|asset| asset.digest.as_deref() == Some(exe_hash))
     } else {
         false
@@ -360,8 +454,8 @@ fn get_releases(
     Ok(releases)
 }
 
-fn launch_game(exe_path_str: &str) {
-    if let Err(err) = std::process::Command::new(exe_path_str).spawn() {
+fn launch_game(game_path: &Path) {
+    if let Err(err) = std::process::Command::new(game_path).spawn() {
         eprintln!("Failed to launch game: {err}");
         std::process::exit(1);
     } else {
