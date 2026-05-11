@@ -22,7 +22,7 @@ const LAUNCHER_EXECUTABLE_NAME: &str = if cfg!(windows) {
 const GAME_EXECUTABLE_NAME: &str = if cfg!(windows) {
     "CraftMoon.exe"
 } else {
-    "CraftMoon-linux"
+    "CraftMoon-linux.x86_64"
 };
 
 #[derive(Parser, Debug)]
