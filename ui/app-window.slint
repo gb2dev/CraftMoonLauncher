@@ -1,12 +1,42 @@
+import { Button, ProgressIndicator } from "std-widgets.slint";
+
 export component AppWindow inherits Window {
     in-out property <string> status-text;
+    in-out property <float> progress;
+    in-out property <bool> show-launch-button;
+
+    callback launch-game;
+
     default-font-size: 24px;
     title: @tr("CraftMoon Launcher");
     min-width: 640px;
     min-height: 360px;
     max-width: self.min-width;
     max-height: self.min-height;
-    Text {
-        text: root.status-text;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 10px;
+
+        Text {
+            horizontal-alignment: center;
+            text: root.status-text;
+        }
+
+        if progress > 0: ProgressIndicator {
+            x: parent.width / 2 - self.width / 2;
+            width: 300px;
+            progress: root.progress;
+        }
+
+        if show-launch-button: Button {
+            text: "Launch CraftMoon";
+            x: parent.width / 2 - self.width / 2;
+            width: self.preferred-width;
+
+            clicked => {
+                root.launch-game();
+            }
+        }
     }
 }

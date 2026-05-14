@@ -85,8 +85,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let install_dir = install_dir()?;
     std::fs::create_dir_all(&install_dir)?;
+    let game_path = install_dir.join(GAME_EXECUTABLE_NAME);
 
     let ui = AppWindow::new()?;
+
+    let game_path_for_launch = game_path.clone();
+    ui.on_launch_game(move || {
+        launch_game(&game_path_for_launch);
+    });
 
     let ui_weak = ui.as_weak();
     std::thread::spawn(move || {
@@ -99,16 +105,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
 
-        let game_path = install_dir.join(GAME_EXECUTABLE_NAME);
+        let mut game_update_failed = false;
 
         if !args.no_game_update {
             let client = reqwest::blocking::Client::builder()
                 .timeout(None)
                 .build()
                 .unwrap();
-            let exe_file = std::fs::read(&game_path)
-                .inspect_err(|err| eprintln!("Failed to read game executable: {err}"))
-                .ok();
+            let exe_file = match std::fs::read(&game_path) {
+                Ok(exe_file) => Some(exe_file),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    eprintln!("Failed to read game executable: {err}");
+                    None
+                }
+            };
             let exe_hash = if let Some(exe_file) = exe_file {
                 Some(format!("sha256:{}", hex_digest(Sha256::digest(exe_file))))
             } else {
@@ -117,11 +128,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             let (releases, is_running_latest) =
                 check_for_updated_release(&client, &ui_weak, "CraftMoon", false, &exe_hash);
             if !is_running_latest {
-                update_game(&client, &ui_weak, releases, &game_path, exe_hash);
+                game_update_failed =
+                    !update_game(&client, &ui_weak, releases, &game_path, exe_hash);
             }
         }
 
-        if game_path.exists() {
+        if game_update_failed && game_path.exists() {
+            ui_weak
+                .upgrade_in_event_loop(move |ui| {
+                    ui.set_show_launch_button(true);
+                    ui.set_status_text("Update failed. Launch anyway?".into());
+                })
+                .unwrap();
+        } else if game_path.exists() {
             launch_game(&game_path);
         } else {
             set_status(
@@ -160,7 +179,7 @@ fn update_launcher(
         .iter()
         .find(|&asset| is_platform_executable_asset(asset, LAUNCHER_EXECUTABLE_NAME))
     else {
-        eprintln!("No launcher release asset found for this platform");
+        eprintln!("No launcher release asset found for this platform.");
         return;
     };
 
@@ -186,7 +205,12 @@ fn update_launcher(
         })
         .unwrap();
 
-    if let Err(err) = download_file(client, &exe_asset.browser_download_url, &destination) {
+    if let Err(err) = download_file(
+        client,
+        &exe_asset.browser_download_url,
+        &destination,
+        ui_weak,
+    ) {
         eprintln!("Failed to download CraftMoonLauncher update: {err}");
         return;
     }
@@ -215,7 +239,7 @@ fn update_game(
     releases: Vec<Release>,
     game_path: &Path,
     exe_hash: Option<String>,
-) {
+) -> bool {
     let installed_release_index = releases.iter().position(|release| {
         release
             .assets
@@ -261,7 +285,9 @@ fn update_game(
 
             let destination = temp_dir.join(&asset.name);
 
-            if let Err(err) = download_file(client, &asset.browser_download_url, &destination) {
+            if let Err(err) =
+                download_file(client, &asset.browser_download_url, &destination, ui_weak)
+            {
                 eprintln!("Failed to download CraftMoon update: {err}");
                 reinstall_game = true;
                 break;
@@ -280,7 +306,15 @@ fn update_game(
     }
 
     if reinstall_game {
-        let message = format!("Reinstalling CraftMoon...").into();
+        let is_first_install = game_path
+            .read_dir()
+            .map_or_else(|_| true, |mut it| it.next().is_none());
+
+        let message = if is_first_install {
+            "Installing CraftMoon...".into()
+        } else {
+            "Reinstalling CraftMoon...".into()
+        };
         ui_weak
             .upgrade_in_event_loop(move |ui| {
                 ui.set_status_text(message);
@@ -293,20 +327,23 @@ fn update_game(
             .iter()
             .find(|&asset| is_platform_executable_asset(asset, GAME_EXECUTABLE_NAME))
         else {
-            let message = "No game release asset found for this platform";
+            let message = "No game release asset found for this platform.";
             eprintln!("{message}");
             set_status(ui_weak, message);
-            return;
+            return false;
         };
-        if let Err(err) = download_file(client, &exe_asset.browser_download_url, game_path) {
+        if let Err(err) = download_file(client, &exe_asset.browser_download_url, game_path, ui_weak)
+        {
             eprintln!("Failed to download CraftMoon: {err}");
-            return;
+            return false;
         }
         if let Err(err) = make_executable(game_path) {
             eprintln!("Failed to mark CraftMoon executable: {err}");
-            return;
+            return false;
         }
     }
+
+    true
 }
 
 fn is_platform_executable_asset(asset: &Asset, executable_name: &str) -> bool {
@@ -368,20 +405,44 @@ fn download_file(
     client: &reqwest::blocking::Client,
     url: &str,
     destination: impl AsRef<Path> + Debug,
+    ui_weak: &Weak<AppWindow>,
 ) -> Result<(), Box<dyn Error>> {
-    let file_response = client
+    let mut response = client
         .get(url)
         .header("User-Agent", USER_AGENT_VALUE)
         .send()?;
 
-    if !file_response.status().is_success() {
-        return Err(format!("Status {}", file_response.status()).into());
+    if !response.status().is_success() {
+        return Err(format!("Status {}", response.status()).into());
     }
 
-    let content = file_response.bytes()?;
+    let total_size = response.content_length().unwrap_or(0);
+    let mut downloaded: u64 = 0;
+    let mut last_reported_progress = -1.0;
 
-    let mut file = std::fs::File::create(destination)?;
-    file.write_all(&content)?;
+    let mut file = std::fs::File::create(&destination)?;
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let n = response.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buffer[..n])?;
+        downloaded += n as u64;
+
+        if total_size > 0 {
+            let progress = downloaded as f64 / total_size as f64;
+            if progress - last_reported_progress >= 0.01 {
+                last_reported_progress = progress;
+                let ui = ui_weak.clone();
+                ui.upgrade_in_event_loop(move |ui| {
+                    ui.set_progress(progress as f32);
+                })
+                .unwrap();
+            }
+        }
+    }
 
     Ok(())
 }
