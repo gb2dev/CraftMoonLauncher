@@ -1,4 +1,107 @@
-import { Button, ProgressIndicator } from "std-widgets.slint";
+component Header inherits Rectangle {
+    width: 620px;
+    height: 78px;
+    background: #00000000;
+
+    VerticalLayout {
+        spacing: 2px;
+        alignment: center;
+
+        Text {
+            text: "CraftMoon";
+            color: #f9f9f9;
+            font-size: 44px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "Launcher";
+            color: #7bc9bd;
+            font-size: 16px;
+            letter-spacing: 2px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+component Divider inherits HorizontalLayout {
+    alignment: center;
+
+    Rectangle {
+        width: 520px;
+        height: 1px;
+        background: #23594e;
+    }
+}
+
+component StatusMessage inherits HorizontalLayout {
+    in property <string> message;
+
+    alignment: center;
+
+    Text {
+        width: 600px;
+        height: 150px;
+        text: root.message;
+        color: #eef8f6;
+        font-size: 18px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        wrap: word-wrap;
+    }
+}
+
+component ProgressBar inherits HorizontalLayout {
+    in property <float> value;
+
+    alignment: center;
+
+    Rectangle {
+        width: 430px;
+        height: 8px;
+        background: #17322d;
+        border-radius: 4px;
+        clip: true;
+
+        Rectangle {
+            width: parent.width * root.value;
+            height: parent.height;
+            background: #1d9b88;
+            border-radius: 4px;
+        }
+    }
+}
+
+component LaunchButton inherits HorizontalLayout {
+    callback clicked;
+
+    alignment: center;
+
+    Rectangle {
+        width: 240px;
+        height: 44px;
+        border-radius: 6px;
+        background: button-touch.pressed ? #167c6d : button-touch.has-hover ? #28b6a1 : #1d9b88;
+
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: "Launch CraftMoon";
+            color: #f9f9f9;
+            font-size: 16px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        button-touch := TouchArea {
+            clicked => {
+                root.clicked();
+            }
+        }
+    }
+}
 
 export component AppWindow inherits Window {
     in-out property <string> status-text;
@@ -7,33 +110,35 @@ export component AppWindow inherits Window {
 
     callback launch-game;
 
-    default-font-size: 24px;
+    default-font-size: 18px;
     title: @tr("CraftMoon Launcher");
-    min-width: 640px;
-    min-height: 360px;
-    max-width: self.min-width;
-    max-height: self.min-height;
+    preferred-width: 760px;
+    preferred-height: 500px;
+    min-width: 700px;
+    min-height: 460px;
+    background: #0f1715;
 
     VerticalLayout {
+        padding-left: 48px;
+        padding-right: 48px;
+        padding-top: 44px;
+        padding-bottom: 38px;
+        spacing: 26px;
         alignment: center;
-        spacing: 10px;
 
-        Text {
-            horizontal-alignment: center;
-            text: root.status-text;
+        Header { }
+
+        Divider { }
+
+        StatusMessage {
+            message: root.status-text;
         }
 
-        if progress > 0: ProgressIndicator {
-            x: parent.width / 2 - self.width / 2;
-            width: 300px;
-            progress: root.progress;
+        if progress > 0: ProgressBar {
+            value: root.progress;
         }
 
-        if show-launch-button: Button {
-            text: "Launch CraftMoon";
-            x: parent.width / 2 - self.width / 2;
-            width: self.preferred-width;
-
+        if show-launch-button: LaunchButton {
             clicked => {
                 root.launch-game();
             }
