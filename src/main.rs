@@ -142,8 +142,7 @@ fn main() -> anyhow::Result<()> {
             Ok(client) => client,
             Err(err) => {
                 let message = format!("Failed to create HTTP client: {err}");
-                eprintln!("{message}");
-                set_status(&ui_weak, message);
+                set_error_status(&ui_weak, message);
                 return;
             }
         };
@@ -170,15 +169,13 @@ fn main() -> anyhow::Result<()> {
                         },
                     ) {
                         let message = format!("CraftMoon update failed: {err}");
-                        eprintln!("{message}");
-                        set_status(&ui_weak, message);
+                        set_error_status(&ui_weak, message);
                         game_update_failed = true;
                     }
                 }
                 Err(err) => {
                     let message = format!("Failed to check CraftMoon updates: {err}");
-                    eprintln!("{message}");
-                    set_status(&ui_weak, message);
+                    set_error_status(&ui_weak, message);
                     game_update_failed = true;
                 }
             }
@@ -339,6 +336,14 @@ fn describe_update_status(ui_weak: &Weak<AppWindow>, status: &UpdateStatus) {
 fn set_status(ui_weak: &Weak<AppWindow>, message: impl Into<String>) {
     let message = message.into();
     println!("{message}");
+    let _ = ui_weak.upgrade_in_event_loop(move |ui| {
+        ui.set_status_text(message.into());
+    });
+}
+
+fn set_error_status(ui_weak: &Weak<AppWindow>, message: impl Into<String>) {
+    let message = message.into();
+    eprintln!("{message}");
     let _ = ui_weak.upgrade_in_event_loop(move |ui| {
         ui.set_status_text(message.into());
     });
