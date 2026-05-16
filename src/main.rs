@@ -18,7 +18,7 @@ mod updater;
 mod version;
 
 use github::{LAUNCHER_REPO, fetch_latest_release_for_repo, github_client};
-use make_patch::make_patch;
+use make_patch::{PatchPlatform, make_archive, make_patch};
 use platform::{GAME_EXECUTABLE_NAME, LAUNCHER_EXECUTABLE_NAME, make_executable, strip_leading_v};
 use updater::{UpdateStatus, check_for_update, perform_update};
 
@@ -41,7 +41,7 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Create Windows and Linux patch bundles from extracted old/new game directories.
+    /// Create Windows and/or Linux patch bundles from extracted old/new game directories.
     MakePatch {
         /// Path to previous version's extracted game files.
         #[arg(long)]
@@ -62,22 +62,62 @@ enum Commands {
         /// Directory to write patch bundles into.
         #[arg(long)]
         out_dir: PathBuf,
+
+        /// Target platform (windows, linux, or both). Default: both.
+        #[arg(long, default_value = "both")]
+        platform: String,
+    },
+
+    /// Create a full game archive (ZIP on Windows, tar.gz on Linux).
+    MakeArchive {
+        /// Path to the extracted game directory to archive.
+        #[arg(long)]
+        dir: PathBuf,
+
+        /// Directory to write the archive into.
+        #[arg(long)]
+        out_dir: PathBuf,
+
+        /// Target platform (windows or linux). Defaults to current platform.
+        #[arg(long)]
+        platform: Option<String>,
     },
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    if let Some(Commands::MakePatch {
-        old_dir,
-        new_dir,
-        from_tag,
-        to_tag,
-        out_dir,
-    }) = args.command
-    {
-        make_patch(old_dir, new_dir, &from_tag, &to_tag, out_dir)?;
-        return Ok(());
+    match args.command {
+        Some(Commands::MakePatch {
+            old_dir,
+            new_dir,
+            from_tag,
+            to_tag,
+            out_dir,
+            platform,
+        }) => {
+            let platform: PatchPlatform = platform
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!("invalid --platform value: {e}"))?;
+            make_patch(old_dir, new_dir, &from_tag, &to_tag, out_dir, platform)?;
+            return Ok(());
+        }
+        Some(Commands::MakeArchive {
+            dir,
+            out_dir,
+            platform,
+        }) => {
+            let platform = match platform {
+                Some(p) => Some(
+                    p.parse::<PatchPlatform>()
+                        .map_err(|e| anyhow::anyhow!("invalid --platform value: {e}"))?,
+                ),
+                None => None,
+            };
+            make_archive(dir, out_dir, platform)?;
+            return Ok(());
+        }
+        None => {}
     }
 
     let install_dir = install_dir()?;

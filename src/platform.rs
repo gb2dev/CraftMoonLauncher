@@ -12,15 +12,14 @@ pub const GAME_EXECUTABLE_NAME: &str = if cfg!(windows) {
     "CraftMoon-linux.x86_64"
 };
 
-pub const FULL_ARCHIVE_NAME: &str = if cfg!(windows) {
-    "CraftMoon-windows.zip"
-} else {
-    "CraftMoon-linux.tar.gz"
-};
+pub const WINDOWS_ARCHIVE_NAME: &str = "CraftMoon-windows.zip";
+pub const LINUX_ARCHIVE_NAME: &str = "CraftMoon-linux.tar.gz";
 
-pub fn full_archive_name_for_current_platform() -> &'static str {
-    FULL_ARCHIVE_NAME
-}
+pub const FULL_ARCHIVE_NAME: &str = if cfg!(windows) {
+    WINDOWS_ARCHIVE_NAME
+} else {
+    LINUX_ARCHIVE_NAME
+};
 
 pub fn platform_patch_asset_name(from_tag: &str, to_tag: &str) -> String {
     let from = strip_leading_v(from_tag);

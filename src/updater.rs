@@ -11,8 +11,7 @@ use crate::github::{GitHubRelease, fetch_latest_release, fetch_release_by_tag, f
 use crate::hash::hash_file;
 use crate::patch::apply_patch_bundle;
 use crate::platform::{
-    full_archive_name_for_current_platform, platform_patch_asset_name,
-    set_linux_game_executable_permission,
+    FULL_ARCHIVE_NAME, platform_patch_asset_name, set_linux_game_executable_permission,
 };
 use crate::version::{
     InstalledVersion, read_version, verify_installed_files, write_version_atomic,
@@ -110,7 +109,7 @@ fn install_full_archive(
     latest: &GitHubRelease,
     mut set_progress: impl FnMut(u64, u64),
 ) -> anyhow::Result<()> {
-    let archive_name = full_archive_name_for_current_platform();
+    let archive_name = FULL_ARCHIVE_NAME;
     let asset = latest
         .assets
         .iter()

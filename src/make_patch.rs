@@ -4,7 +4,9 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 
 use anyhow::Context;
+use flate2::write::GzEncoder;
 use qbsdiff::Bsdiff;
+use tar::Builder as TarBuilder;
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -12,8 +14,40 @@ use zip::{CompressionMethod, ZipWriter};
 use crate::extract::{relative_path_string, sanitise_path};
 use crate::hash::{hash_bytes, hash_file};
 use crate::patch::{PatchFileEntry, PatchIndex, PatchOp, bsdiff_entry_name, create_entry_name};
-use crate::platform::strip_leading_v;
+use crate::platform::{LINUX_ARCHIVE_NAME, WINDOWS_ARCHIVE_NAME, strip_leading_v};
 use crate::version::VERSION_FILE_NAME;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchPlatform {
+    Windows,
+    Linux,
+    Both,
+}
+
+impl std::str::FromStr for PatchPlatform {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "windows" | "win" => Ok(Self::Windows),
+            "linux" => Ok(Self::Linux),
+            "both" | "all" => Ok(Self::Both),
+            _ => Err(format!(
+                "unknown platform '{s}', expected 'windows', 'linux', or 'both'"
+            )),
+        }
+    }
+}
+
+impl PatchPlatform {
+    fn include_windows(self) -> bool {
+        matches!(self, Self::Windows | Self::Both)
+    }
+
+    fn include_linux(self) -> bool {
+        matches!(self, Self::Linux | Self::Both)
+    }
+}
 
 pub fn make_patch(
     old_dir: impl AsRef<Path>,
@@ -21,6 +55,7 @@ pub fn make_patch(
     from_tag: &str,
     to_tag: &str,
     out_dir: impl AsRef<Path>,
+    platform: PatchPlatform,
 ) -> anyhow::Result<()> {
     let old_dir = old_dir.as_ref();
     let new_dir = new_dir.as_ref();
@@ -42,16 +77,10 @@ pub fn make_patch(
     let old_files = collect_files(old_dir)?;
     let new_files = collect_files(new_dir)?;
 
-    let windows_name = format!(
-        "{}-to-{}.patch",
-        strip_leading_v(from_tag),
-        strip_leading_v(to_tag)
-    );
-    let linux_name = format!(
-        "{}-to-{}-linux.patch",
-        strip_leading_v(from_tag),
-        strip_leading_v(to_tag)
-    );
+    let from = strip_leading_v(from_tag);
+    let to = strip_leading_v(to_tag);
+    let windows_name = format!("{from}-to-{to}.patch");
+    let linux_name = format!("{from}-to-{to}-linux.patch");
 
     let common = PatchBundleInputs {
         old_dir,
@@ -62,16 +91,20 @@ pub fn make_patch(
         new_files: &new_files,
     };
 
-    generate_patch_bundle(PatchBundleJob {
-        inputs: common,
-        output_path: out_dir.join(windows_name),
-        include: include_in_windows_bundle,
-    })?;
-    generate_patch_bundle(PatchBundleJob {
-        inputs: common,
-        output_path: out_dir.join(linux_name),
-        include: include_in_linux_bundle,
-    })?;
+    if platform.include_windows() {
+        generate_patch_bundle(PatchBundleJob {
+            inputs: common,
+            output_path: out_dir.join(windows_name),
+            include: include_in_windows_bundle,
+        })?;
+    }
+    if platform.include_linux() {
+        generate_patch_bundle(PatchBundleJob {
+            inputs: common,
+            output_path: out_dir.join(linux_name),
+            include: include_in_linux_bundle,
+        })?;
+    }
 
     Ok(())
 }
@@ -237,17 +270,22 @@ impl PatchStats {
     }
 }
 
+fn create_zip_writer(output_path: &Path) -> anyhow::Result<(ZipWriter<File>, SimpleFileOptions)> {
+    let file = File::create(output_path)
+        .with_context(|| format!("failed to create {}", output_path.display()))?;
+    let zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .unix_permissions(0o644);
+    Ok((zip, options))
+}
+
 fn write_patch_zip(
     output_path: &Path,
     index: &PatchIndex,
     payloads: Vec<(String, Vec<u8>)>,
 ) -> anyhow::Result<()> {
-    let file = File::create(output_path)
-        .with_context(|| format!("failed to create {}", output_path.display()))?;
-    let mut zip = ZipWriter::new(file);
-    let options = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .unix_permissions(0o644);
+    let (mut zip, options) = create_zip_writer(output_path)?;
 
     zip.start_file("patch.index", options)
         .context("failed to write patch.index ZIP entry")?;
@@ -305,14 +343,101 @@ fn should_skip_dev_file(relative_path: &str) -> bool {
 
 fn include_in_windows_bundle(relative_path: &str) -> bool {
     let lower = relative_path.to_ascii_lowercase();
-    !has_path_component(&lower, "linux") && !lower.ends_with(".x86_64")
+    !has_path_component(&lower, "linux") && !lower.ends_with(".x86_64") && !lower.ends_with(".so")
 }
 
 fn include_in_linux_bundle(relative_path: &str) -> bool {
     let lower = relative_path.to_ascii_lowercase();
-    !has_path_component(&lower, "win") && !lower.ends_with(".exe") && !lower.ends_with(".dll")
+    !has_path_component(&lower, "win")
+        && !lower.ends_with(".exe")
+        && !lower.ends_with(".dll")
+        && !lower.ends_with(".pdb")
+        && !lower.ends_with(".manifest")
+        && !lower.ends_with(".lib")
+        && !lower.ends_with(".exp")
 }
 
 fn has_path_component(relative_path: &str, component: &str) -> bool {
     relative_path.split('/').any(|part| part == component)
+        || relative_path.split('\\').any(|part| part == component)
+}
+
+pub fn make_archive(
+    dir: impl AsRef<Path>,
+    out_dir: impl AsRef<Path>,
+    platform: Option<PatchPlatform>,
+) -> anyhow::Result<()> {
+    let dir = dir.as_ref();
+    let out_dir = out_dir.as_ref();
+
+    anyhow::ensure!(dir.is_dir(), "dir is not a directory: {}", dir.display());
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("failed to create out-dir {}", out_dir.display()))?;
+
+    let is_windows = platform.map_or_else(|| cfg!(windows), |p| p == PatchPlatform::Windows);
+
+    let files = collect_files(dir)?;
+    anyhow::ensure!(!files.is_empty(), "no files found in {}", dir.display());
+
+    if is_windows {
+        let output_path = out_dir.join(WINDOWS_ARCHIVE_NAME);
+        create_zip_archive(dir, &files, &output_path)?;
+        println!("Wrote {}", output_path.display());
+    } else {
+        let output_path = out_dir.join(LINUX_ARCHIVE_NAME);
+        create_tar_gz_archive(dir, &files, &output_path)?;
+        println!("Wrote {}", output_path.display());
+    }
+
+    Ok(())
+}
+
+fn create_zip_archive(
+    root: &Path,
+    files: &BTreeSet<String>,
+    output_path: &Path,
+) -> anyhow::Result<()> {
+    let (mut zip, options) = create_zip_writer(output_path)?;
+
+    for relative_path in files {
+        sanitise_path(relative_path)?
+            .ok_or_else(|| anyhow::anyhow!("invalid archive path {relative_path}"))?;
+
+        let source_path = root.join(relative_path);
+        zip.start_file(relative_path, options)
+            .with_context(|| format!("failed to write ZIP entry {relative_path}"))?;
+        let data = std::fs::read(&source_path)
+            .with_context(|| format!("failed to read {}", source_path.display()))?;
+        zip.write_all(&data)
+            .with_context(|| format!("failed to write ZIP entry {relative_path}"))?;
+    }
+
+    zip.finish().context("failed to finish archive ZIP")?;
+    Ok(())
+}
+
+fn create_tar_gz_archive(
+    root: &Path,
+    files: &BTreeSet<String>,
+    output_path: &Path,
+) -> anyhow::Result<()> {
+    let file = File::create(output_path)
+        .with_context(|| format!("failed to create {}", output_path.display()))?;
+    let encoder = GzEncoder::new(file, flate2::Compression::default());
+    let mut tar = TarBuilder::new(encoder);
+
+    for relative_path in files {
+        sanitise_path(relative_path)?
+            .ok_or_else(|| anyhow::anyhow!("invalid archive path {relative_path}"))?;
+
+        let source_path = root.join(relative_path);
+        tar.append_path_with_name(&source_path, relative_path)
+            .with_context(|| format!("failed to add {relative_path} to tar"))?;
+    }
+
+    let encoder = tar.into_inner().context("failed to finish tar archive")?;
+    encoder
+        .finish()
+        .context("failed to finish gz compression")?;
+    Ok(())
 }
