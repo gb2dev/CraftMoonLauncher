@@ -374,18 +374,37 @@ pub fn make_archive(
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("failed to create out-dir {}", out_dir.display()))?;
 
-    let is_windows = platform.map_or_else(|| cfg!(windows), |p| p == PatchPlatform::Windows);
+    let all_files = collect_files(dir)?;
+    anyhow::ensure!(!all_files.is_empty(), "no files found in {}", dir.display());
 
-    let files = collect_files(dir)?;
-    anyhow::ensure!(!files.is_empty(), "no files found in {}", dir.display());
+    let build_windows = platform.map_or_else(
+        || cfg!(windows),
+        |p| p == PatchPlatform::Windows || p == PatchPlatform::Both,
+    );
+    let build_linux = platform.map_or_else(
+        || !cfg!(windows),
+        |p| p == PatchPlatform::Linux || p == PatchPlatform::Both,
+    );
 
-    if is_windows {
+    if build_windows {
+        let windows_files: BTreeSet<String> = all_files
+            .iter()
+            .filter(|f| include_in_windows_bundle(f))
+            .cloned()
+            .collect();
         let output_path = out_dir.join(WINDOWS_ARCHIVE_NAME);
-        create_zip_archive(dir, &files, &output_path)?;
+        create_zip_archive(dir, &windows_files, &output_path)?;
         println!("Wrote {}", output_path.display());
-    } else {
+    }
+
+    if build_linux {
+        let linux_files: BTreeSet<String> = all_files
+            .iter()
+            .filter(|f| include_in_linux_bundle(f))
+            .cloned()
+            .collect();
         let output_path = out_dir.join(LINUX_ARCHIVE_NAME);
-        create_tar_gz_archive(dir, &files, &output_path)?;
+        create_tar_gz_archive(dir, &linux_files, &output_path)?;
         println!("Wrote {}", output_path.display());
     }
 

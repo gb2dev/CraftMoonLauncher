@@ -9,18 +9,20 @@ use slint::Weak;
 
 mod download;
 mod extract;
-mod github;
+mod http;
 mod hash;
 mod make_patch;
+mod manifest;
 mod patch;
 mod platform;
 mod updater;
 mod version;
 
-use github::{LAUNCHER_REPO, fetch_latest_release_for_repo, github_client};
+use http::http_client;
 use make_patch::{PatchPlatform, make_archive, make_patch};
+use manifest::{Manifest, fetch_manifest};
 use platform::{GAME_EXECUTABLE_NAME, LAUNCHER_EXECUTABLE_NAME, make_executable, strip_leading_v};
-use updater::{UpdateStatus, check_for_update, perform_update};
+use updater::{UpdateStatus, check_for_update, download_with_fallback, perform_update};
 
 slint::include_modules!();
 
@@ -138,7 +140,7 @@ fn main() -> anyhow::Result<()> {
 
     let ui_weak = ui.as_weak();
     std::thread::spawn(move || {
-        let client = match github_client() {
+        let client = match http_client() {
             Ok(client) => client,
             Err(err) => {
                 let message = format!("Failed to create HTTP client: {err}");
@@ -146,22 +148,43 @@ fn main() -> anyhow::Result<()> {
                 return;
             }
         };
+        set_status(&ui_weak, "Checking for updates...");
+        let manifest = match fetch_manifest(&client) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                let message = format!("Failed to fetch update manifest: {err}");
+                set_error_status(&ui_weak, &message);
+                if game_path.exists() {
+                    let _ = ui_weak.upgrade_in_event_loop(move |ui| {
+                        ui.set_progress(0.0);
+                        ui.set_show_launch_button(true);
+                        ui.set_status_text(
+                            "Could not check for updates. Launch anyway?".into(),
+                        );
+                    });
+                } else {
+                    set_error_status(&ui_weak, message);
+                }
+                return;
+            }
+        };
 
         if !args.no_self_update {
-            update_launcher(&client, &ui_weak);
+            update_launcher(&client, &manifest, &ui_weak);
         }
 
         let mut game_update_failed = false;
         if !args.no_game_update {
             set_status(&ui_weak, "Checking CraftMoon for updates...");
-            match check_for_update(&client, &install_dir) {
+            match check_for_update(&manifest, &install_dir) {
                 Ok(status) => {
-                    describe_update_status(&ui_weak, &status);
+                    describe_update_status(&ui_weak, &manifest, &status);
                     let status_ui = ui_weak.clone();
                     let progress_ui = ui_weak.clone();
                     if let Err(err) = perform_update(
                         &client,
                         &install_dir,
+                        &manifest,
                         status,
                         move |message| set_status(&status_ui, message),
                         move |downloaded, total| {
@@ -219,31 +242,22 @@ fn install_dir() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("failed to find user data directory"))
 }
 
-fn update_launcher(client: &reqwest::blocking::Client, ui_weak: &Weak<AppWindow>) {
+fn update_launcher(client: &reqwest::blocking::Client, manifest: &Manifest, ui_weak: &Weak<AppWindow>) {
     set_status(ui_weak, "Checking CraftMoon Launcher for updates...");
 
-    let latest = match fetch_latest_release_for_repo(client, LAUNCHER_REPO) {
-        Ok(latest) => latest,
-        Err(err) => {
-            eprintln!("Failed to check CraftMoon Launcher updates: {err}");
-            return;
-        }
-    };
-
-    if launcher_version_matches(&latest.tag_name) {
+    if launcher_version_matches(&manifest.launcher_version) {
         return;
     }
 
-    let Some(asset) = latest
-        .assets
-        .iter()
-        .find(|asset| asset.name == LAUNCHER_EXECUTABLE_NAME)
-    else {
-        eprintln!(
-            "No CraftMoon Launcher release asset named {} found in {}.",
-            LAUNCHER_EXECUTABLE_NAME, latest.tag_name
-        );
-        return;
+    let launcher_binary = LAUNCHER_EXECUTABLE_NAME;
+    let expected_hash = match manifest.launcher_binaries.get(launcher_binary) {
+        Some(hash) => hash,
+        None => {
+            eprintln!(
+                "Manifest does not list launcher binary {launcher_binary} for this platform."
+            );
+            return;
+        }
     };
 
     let current_exe = match std::env::current_exe() {
@@ -260,15 +274,18 @@ fn update_launcher(client: &reqwest::blocking::Client, ui_weak: &Weak<AppWindow>
 
     set_status(
         ui_weak,
-        format!("Downloading CraftMoon Launcher {}...", latest.tag_name),
+        format!(
+            "Downloading CraftMoon Launcher {}...",
+            manifest.launcher_version
+        ),
     );
-    let temp = match download::download_asset_to_temp(
+    let temp = match download_with_fallback(
         client,
-        &asset.browser_download_url,
-        &asset.name,
-        asset.size,
+        &manifest.endpoints,
+        launcher_binary,
+        expected_hash,
         &download_dir,
-        |downloaded, total| set_download_progress(ui_weak, downloaded, total),
+        &mut |downloaded, total| set_download_progress(ui_weak, downloaded, total),
     ) {
         Ok(temp) => temp,
         Err(err) => {
@@ -297,38 +314,37 @@ fn launcher_version_matches(latest_tag: &str) -> bool {
         || strip_leading_v(latest_tag) == env!("CARGO_PKG_VERSION")
 }
 
-fn describe_update_status(ui_weak: &Weak<AppWindow>, status: &UpdateStatus) {
+fn describe_update_status(ui_weak: &Weak<AppWindow>, manifest: &Manifest, status: &UpdateStatus) {
     match status {
-        UpdateStatus::FirstInstall { latest } => {
+        UpdateStatus::FirstInstall => {
             set_status(
                 ui_weak,
-                format!("CraftMoon {} is available.", latest.tag_name),
+                format!("CraftMoon {} is available.", manifest.game_version),
             );
         }
-        UpdateStatus::CorruptInstall { latest } => {
+        UpdateStatus::CorruptInstall => {
             set_status(
                 ui_weak,
                 format!(
                     "CraftMoon install is corrupted; latest is {}.",
-                    latest.tag_name
+                    manifest.game_version
                 ),
             );
         }
-        UpdateStatus::UpdateAvailable { latest, installed } => {
+        UpdateStatus::UpdateAvailable { installed } => {
             set_status(
                 ui_weak,
                 format!(
                     "CraftMoon update available: {} -> {}.",
-                    installed.tag, latest.tag_name
+                    installed.tag, manifest.game_version
                 ),
             );
         }
-        UpdateStatus::UpToDate { latest, installed } => {
+        UpdateStatus::UpToDate => {
             set_status(
                 ui_weak,
-                format!("CraftMoon {} is up to date.", latest.tag_name),
+                format!("CraftMoon {} is up to date.", manifest.game_version),
             );
-            let _ = installed;
         }
     }
 }

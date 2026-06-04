@@ -21,16 +21,6 @@ pub const FULL_ARCHIVE_NAME: &str = if cfg!(windows) {
     LINUX_ARCHIVE_NAME
 };
 
-pub fn platform_patch_asset_name(from_tag: &str, to_tag: &str) -> String {
-    let from = strip_leading_v(from_tag);
-    let to = strip_leading_v(to_tag);
-    if cfg!(windows) {
-        format!("{from}-to-{to}.patch")
-    } else {
-        format!("{from}-to-{to}-linux.patch")
-    }
-}
-
 pub fn strip_leading_v(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }

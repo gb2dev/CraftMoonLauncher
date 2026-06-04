@@ -3,15 +3,14 @@ use std::path::Path;
 
 use anyhow::Context;
 use reqwest::blocking::Client;
-use semver::Version;
 
 use crate::download::download_asset_to_temp;
 use crate::extract::{extract_tar_gz, extract_zip, sanitise_path};
-use crate::github::{GitHubRelease, fetch_latest_release, fetch_release_by_tag, fetch_releases};
 use crate::hash::hash_file;
+use crate::manifest::Manifest;
 use crate::patch::apply_patch_bundle;
 use crate::platform::{
-    FULL_ARCHIVE_NAME, platform_patch_asset_name, set_linux_game_executable_permission,
+    FULL_ARCHIVE_NAME, set_linux_game_executable_permission,
 };
 use crate::version::{
     InstalledVersion, read_version, verify_installed_files, write_version_atomic,
@@ -19,47 +18,39 @@ use crate::version::{
 
 #[derive(Debug)]
 pub enum UpdateStatus {
-    FirstInstall {
-        latest: GitHubRelease,
-    },
-    CorruptInstall {
-        latest: GitHubRelease,
-    },
+    FirstInstall,
+    CorruptInstall,
     UpdateAvailable {
-        latest: GitHubRelease,
         installed: InstalledVersion,
     },
-    UpToDate {
-        latest: GitHubRelease,
-        installed: InstalledVersion,
-    },
+    UpToDate,
 }
 
 pub fn check_for_update(
-    client: &Client,
+    manifest: &Manifest,
     install_dir: impl AsRef<Path>,
 ) -> anyhow::Result<UpdateStatus> {
     let install_dir = install_dir.as_ref();
-    let latest = fetch_latest_release(client)?;
     let Some(installed) = read_version(install_dir)? else {
-        return Ok(UpdateStatus::FirstInstall { latest });
+        return Ok(UpdateStatus::FirstInstall);
     };
 
     if let Err(err) = verify_installed_files(install_dir, &installed) {
         eprintln!("Installed CraftMoon files failed verification: {err}");
-        return Ok(UpdateStatus::CorruptInstall { latest });
+        return Ok(UpdateStatus::CorruptInstall);
     }
 
-    if installed.tag == latest.tag_name {
-        Ok(UpdateStatus::UpToDate { latest, installed })
+    if installed.tag == manifest.game_version {
+        Ok(UpdateStatus::UpToDate)
     } else {
-        Ok(UpdateStatus::UpdateAvailable { latest, installed })
+        Ok(UpdateStatus::UpdateAvailable { installed })
     }
 }
 
 pub fn perform_update(
     client: &Client,
     install_dir: impl AsRef<Path>,
+    manifest: &Manifest,
     status: UpdateStatus,
     mut set_status: impl FnMut(String),
     mut set_progress: impl FnMut(u64, u64),
@@ -67,26 +58,29 @@ pub fn perform_update(
     let install_dir = install_dir.as_ref();
 
     match status {
-        UpdateStatus::UpToDate { .. } => Ok(()),
-        UpdateStatus::FirstInstall { latest } => {
-            set_status(format!("Installing CraftMoon {}...", latest.tag_name));
-            install_full_archive(client, install_dir, &latest, set_progress)
+        UpdateStatus::UpToDate => Ok(()),
+        UpdateStatus::FirstInstall => {
+            set_status(format!(
+                "Installing CraftMoon {}...",
+                manifest.game_version
+            ));
+            install_full_archive(client, install_dir, manifest, set_progress)
         }
-        UpdateStatus::CorruptInstall { latest } => {
+        UpdateStatus::CorruptInstall => {
             set_status("CraftMoon install is corrupted; reinstalling...".to_string());
-            install_full_archive(client, install_dir, &latest, set_progress)
+            install_full_archive(client, install_dir, manifest, set_progress)
         }
-        UpdateStatus::UpdateAvailable { latest, installed } => {
+        UpdateStatus::UpdateAvailable { installed } => {
             set_status(format!(
                 "Updating CraftMoon {} -> {}...",
-                installed.tag, latest.tag_name
+                installed.tag, manifest.game_version
             ));
 
-            match apply_patch_chain(
+            match try_patch_update(
                 client,
                 install_dir,
+                manifest,
                 &installed,
-                &latest,
                 &mut set_status,
                 &mut set_progress,
             ) {
@@ -96,7 +90,7 @@ pub fn perform_update(
                         "CraftMoon patch update failed ({err}); falling back to full download."
                     );
                     set_status("Patch failed; downloading full CraftMoon archive...".to_string());
-                    install_full_archive(client, install_dir, &latest, set_progress)
+                    install_full_archive(client, install_dir, manifest, set_progress)
                 }
             }
         }
@@ -106,26 +100,24 @@ pub fn perform_update(
 fn install_full_archive(
     client: &Client,
     install_dir: &Path,
-    latest: &GitHubRelease,
+    manifest: &Manifest,
     mut set_progress: impl FnMut(u64, u64),
 ) -> anyhow::Result<()> {
     let archive_name = FULL_ARCHIVE_NAME;
-    let asset = latest
-        .assets
-        .iter()
-        .find(|asset| asset.name == archive_name)
+    let expected_hash = manifest
+        .game_archives
+        .get(archive_name)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "release {} is missing required asset {archive_name}",
-                latest.tag_name
+                "manifest does not list archive {archive_name} for this platform"
             )
         })?;
 
-    let temp = download_asset_to_temp(
+    let temp = download_with_fallback(
         client,
-        &asset.browser_download_url,
-        &asset.name,
-        asset.size,
+        &manifest.endpoints,
+        archive_name,
+        expected_hash,
         install_dir,
         &mut set_progress,
     )?;
@@ -150,7 +142,7 @@ fn install_full_archive(
         remove_stale_managed_files(install_dir, &previous_version, &files)?;
     }
 
-    let version = InstalledVersion::new(latest.tag_name.clone(), files);
+    let version = InstalledVersion::new(manifest.game_version.clone(), files);
     write_version_atomic(install_dir, &version)?;
     Ok(())
 }
@@ -183,64 +175,50 @@ fn remove_stale_managed_files(
     Ok(())
 }
 
-fn apply_patch_chain(
+fn try_patch_update(
     client: &Client,
     install_dir: &Path,
+    manifest: &Manifest,
     installed: &InstalledVersion,
-    latest: &GitHubRelease,
     set_status: &mut impl FnMut(String),
     set_progress: &mut impl FnMut(u64, u64),
 ) -> anyhow::Result<()> {
-    let chain = build_patch_chain(client, &installed.tag, &latest.tag_name)?;
+    let chain = build_patch_chain(manifest, &installed.tag, &manifest.game_version)?;
     anyhow::ensure!(
         !chain.is_empty(),
         "could not build patch chain from {} to {}",
         installed.tag,
-        latest.tag_name
+        manifest.game_version
     );
 
     let mut current_version = installed.clone();
     let total_steps = chain.len();
 
-    for (index, target_tag) in chain.iter().enumerate() {
+    for (index, (target_tag, patch_name, expected_hash)) in chain.iter().enumerate() {
         let step = index + 1;
-        let expected_asset_name = platform_patch_asset_name(&current_version.tag, target_tag);
+
         set_status(format!(
-            "Downloading CraftMoon patch {step}/{total_steps}: {} -> {}...",
-            current_version.tag, target_tag
+            "Downloading CraftMoon patch {step}/{total_steps}: {} -> {target_tag}...",
+            current_version.tag
         ));
 
-        let release = fetch_release_by_tag(client, target_tag)?;
-        let asset = release
-            .assets
-            .iter()
-            .find(|asset| asset.name == expected_asset_name)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "release {} is missing required patch asset {}",
-                    release.tag_name,
-                    expected_asset_name
-                )
-            })?;
-
-        let temp = download_asset_to_temp(
+        let temp = download_with_fallback(
             client,
-            &asset.browser_download_url,
-            &asset.name,
-            asset.size,
+            &manifest.endpoints,
+            patch_name,
+            expected_hash,
             install_dir,
             &mut *set_progress,
         )?;
 
         set_status(format!(
-            "Applying CraftMoon patch {step}/{total_steps}: {} -> {}...",
-            current_version.tag, target_tag
+            "Applying CraftMoon patch {step}/{total_steps}: {} -> {target_tag}...",
+            current_version.tag
         ));
         let patched_version = apply_patch_bundle(temp.path(), install_dir, &current_version)?;
         anyhow::ensure!(
             patched_version.tag == *target_tag,
-            "patch bundle target tag mismatch: expected {}, got {}",
-            target_tag,
+            "patch bundle target tag mismatch: expected {target_tag}, got {}",
             patched_version.tag
         );
         set_linux_game_executable_permission(install_dir)?;
@@ -251,46 +229,97 @@ fn apply_patch_chain(
     Ok(())
 }
 
-fn build_patch_chain(client: &Client, from_tag: &str, to_tag: &str) -> anyhow::Result<Vec<String>> {
-    let mut releases = fetch_releases(client)?;
-    anyhow::ensure!(
-        !releases.is_empty(),
-        "GitHub returned no CraftMoon releases"
-    );
+fn build_patch_chain(
+    manifest: &Manifest,
+    from_tag: &str,
+    to_tag: &str,
+) -> anyhow::Result<Vec<(String, String, String)>> {
+    use std::collections::{HashMap, VecDeque};
 
-    releases.sort_by(|a, b| compare_tags(&a.tag_name, &b.tag_name));
+    let platform_suffix = if cfg!(windows) { ".patch" } else { "-linux.patch" };
+    let mut edges: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
 
-    let from_index = releases
-        .iter()
-        .position(|release| release.tag_name == from_tag)
-        .ok_or_else(|| {
-            anyhow::anyhow!("installed tag {from_tag} was not found in GitHub releases")
-        })?;
-    let to_index = releases
-        .iter()
-        .position(|release| release.tag_name == to_tag)
-        .ok_or_else(|| anyhow::anyhow!("latest tag {to_tag} was not found in GitHub releases"))?;
+    for (filename, hash) in &manifest.patches {
+        if cfg!(windows) && filename.ends_with("-linux.patch") {
+            continue;
+        }
+        if cfg!(not(windows)) && !filename.ends_with("-linux.patch") {
+            continue;
+        }
 
-    anyhow::ensure!(
-        from_index < to_index,
-        "installed tag {from_tag} is not older than latest tag {to_tag}"
-    );
-
-    Ok(releases[from_index + 1..=to_index]
-        .iter()
-        .map(|release| release.tag_name.clone())
-        .collect())
-}
-
-fn compare_tags(a: &str, b: &str) -> std::cmp::Ordering {
-    match (parse_semver_tag(a), parse_semver_tag(b)) {
-        (Some(a), Some(b)) => a.cmp(&b),
-        (Some(_), None) => std::cmp::Ordering::Greater,
-        (None, Some(_)) => std::cmp::Ordering::Less,
-        (None, None) => a.cmp(b),
+        let stem = filename.strip_suffix(platform_suffix).unwrap_or_default();
+        if let Some((from, to)) = stem.split_once("-to-") {
+            edges
+                .entry(from.to_string())
+                .or_default()
+                .push((to.to_string(), filename.clone(), hash.clone()));
+        }
     }
+
+    let mut queue = VecDeque::new();
+    let mut visited: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    queue.push_back(from_tag.to_string());
+    visited.insert(from_tag.to_string(), Vec::new());
+
+    while let Some(current) = queue.pop_front() {
+        if current == to_tag {
+            return Ok(visited.remove(&current).unwrap());
+        }
+
+        if let Some(neighbors) = edges.get(&current) {
+            for (next_tag, patch_name, hash) in neighbors {
+                if visited.contains_key(next_tag) {
+                    continue;
+                }
+                let mut path = visited[&current].clone();
+                path.push((next_tag.clone(), patch_name.clone(), hash.clone()));
+                visited.insert(next_tag.clone(), path);
+                queue.push_back(next_tag.clone());
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "no patch chain found from {from_tag} to {to_tag} in manifest"
+    )
 }
 
-fn parse_semver_tag(tag: &str) -> Option<Version> {
-    Version::parse(tag.strip_prefix('v').unwrap_or(tag)).ok()
+pub fn download_with_fallback(
+    client: &Client,
+    endpoints: &[String],
+    filename: &str,
+    expected_hash: &str,
+    install_dir: &Path,
+    progress: &mut impl FnMut(u64, u64),
+) -> anyhow::Result<crate::download::TempDownload> {
+    let mut last_error = None;
+
+    for (i, endpoint) in endpoints.iter().enumerate() {
+        let url = format!("{endpoint}/download/{filename}");
+
+        match download_asset_to_temp(client, &url, filename, 0, install_dir, &mut *progress) {
+            Ok(temp) => {
+                if !expected_hash.is_empty() {
+                    let actual = hash_file(temp.path())?;
+                    if actual != expected_hash {
+                        eprintln!(
+                            "Endpoint {i} ({endpoint}): hash mismatch for {filename} \
+                             (expected {expected_hash}, got {actual})"
+                        );
+                        last_error = Some(anyhow::anyhow!(
+                            "hash mismatch from endpoint {i} for {filename}"
+                        ));
+                        continue;
+                    }
+                }
+                return Ok(temp);
+            }
+            Err(err) => {
+                eprintln!("Endpoint {i} ({endpoint}) failed for {filename}: {err}");
+                last_error = Some(err);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no download endpoints available")))
 }
