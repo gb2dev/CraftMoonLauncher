@@ -50,7 +50,23 @@ pub fn download_asset_to_temp(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid asset name {asset_name}"))?;
-    let destination = install_dir.join(format!(".{safe_name}.tmp"));
+    let (_, destination) = tempfile::Builder::new()
+        .prefix(&format!(".{safe_name}."))
+        .suffix(".tmp")
+        .tempfile_in(install_dir)
+        .with_context(|| {
+            format!(
+                "failed to create a temporary download in {}",
+                install_dir.display()
+            )
+        })?
+        .keep()
+        .with_context(|| {
+            format!(
+                "failed to preserve temporary download in {}",
+                install_dir.display()
+            )
+        })?;
     let temp = TempDownload { path: destination };
 
     let mut response = client

@@ -1,9 +1,12 @@
 use std::path::Path;
 
-pub const LAUNCHER_EXECUTABLE_NAME: &str = if cfg!(windows) {
-    "craftmoon-launcher.exe"
+pub const WINDOWS_PLATFORM: &str = "windows";
+pub const LINUX_PLATFORM: &str = "linux";
+
+pub const CURRENT_PLATFORM: &str = if cfg!(windows) {
+    WINDOWS_PLATFORM
 } else {
-    "craftmoon-launcher-linux"
+    LINUX_PLATFORM
 };
 
 pub const GAME_EXECUTABLE_NAME: &str = if cfg!(windows) {
@@ -12,17 +15,20 @@ pub const GAME_EXECUTABLE_NAME: &str = if cfg!(windows) {
     "CraftMoon-linux.x86_64"
 };
 
-pub const WINDOWS_ARCHIVE_NAME: &str = "CraftMoon-windows.zip";
-pub const LINUX_ARCHIVE_NAME: &str = "CraftMoon-linux.tar.gz";
+pub fn game_archive_asset_name(platform: &str, version: &str) -> anyhow::Result<String> {
+    match platform {
+        WINDOWS_PLATFORM => Ok(format!("CraftMoon-windows-{version}.zip")),
+        LINUX_PLATFORM => Ok(format!("CraftMoon-linux-{version}.tar.gz")),
+        _ => anyhow::bail!("unsupported platform {platform}"),
+    }
+}
 
-pub const FULL_ARCHIVE_NAME: &str = if cfg!(windows) {
-    WINDOWS_ARCHIVE_NAME
-} else {
-    LINUX_ARCHIVE_NAME
-};
-
-pub fn strip_leading_v(tag: &str) -> &str {
-    tag.strip_prefix('v').unwrap_or(tag)
+pub fn launcher_asset_name(platform: &str, version: &str) -> anyhow::Result<String> {
+    match platform {
+        WINDOWS_PLATFORM => Ok(format!("craftmoon-launcher-windows-{version}.exe")),
+        LINUX_PLATFORM => Ok(format!("craftmoon-launcher-linux-{version}")),
+        _ => anyhow::bail!("unsupported platform {platform}"),
+    }
 }
 
 pub fn set_linux_game_executable_permission(install_dir: impl AsRef<Path>) -> anyhow::Result<()> {

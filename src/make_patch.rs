@@ -11,10 +11,10 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
-use crate::extract::{relative_path_string, sanitise_path};
-use crate::hash::{hash_bytes, hash_file};
+use crate::extract::{extract_tar_gz, extract_zip, relative_path_string, sanitise_path};
+use crate::hash::{hash_bytes, hash_directory, hash_file};
 use crate::patch::{PatchFileEntry, PatchIndex, PatchOp, bsdiff_entry_name, create_entry_name};
-use crate::platform::{LINUX_ARCHIVE_NAME, WINDOWS_ARCHIVE_NAME, strip_leading_v};
+use crate::platform::{LINUX_PLATFORM, WINDOWS_PLATFORM, game_archive_asset_name};
 use crate::version::VERSION_FILE_NAME;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,16 +71,17 @@ pub fn make_patch(
         "new-dir is not a directory: {}",
         new_dir.display()
     );
+    validate_game_tag(from_tag, "from-tag")?;
+    validate_game_tag(to_tag, "to-tag")?;
+    anyhow::ensure!(from_tag != to_tag, "from-tag and to-tag must differ");
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("failed to create out-dir {}", out_dir.display()))?;
 
     let old_files = collect_files(old_dir)?;
     let new_files = collect_files(new_dir)?;
 
-    let from = strip_leading_v(from_tag);
-    let to = strip_leading_v(to_tag);
-    let windows_name = format!("{from}-to-{to}.patch");
-    let linux_name = format!("{from}-to-{to}-linux.patch");
+    let windows_name = format!("{from_tag}-to-{to_tag}.patch");
+    let linux_name = format!("{from_tag}-to-{to_tag}-linux.patch");
 
     let common = PatchBundleInputs {
         old_dir,
@@ -362,8 +363,22 @@ fn has_path_component(relative_path: &str, component: &str) -> bool {
         || relative_path.split('\\').any(|part| part == component)
 }
 
+fn validate_game_tag(tag: &str, name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !tag.is_empty()
+            && !tag.starts_with('v')
+            && tag.as_bytes()[0].is_ascii_digit()
+            && tag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+        "invalid {name} {tag:?}; use a tag such as 0.4 without a leading v"
+    );
+    Ok(())
+}
+
 pub fn make_archive(
     dir: impl AsRef<Path>,
+    version: &str,
     out_dir: impl AsRef<Path>,
     platform: Option<PatchPlatform>,
 ) -> anyhow::Result<()> {
@@ -371,6 +386,7 @@ pub fn make_archive(
     let out_dir = out_dir.as_ref();
 
     anyhow::ensure!(dir.is_dir(), "dir is not a directory: {}", dir.display());
+    validate_game_tag(version, "version")?;
     std::fs::create_dir_all(out_dir)
         .with_context(|| format!("failed to create out-dir {}", out_dir.display()))?;
 
@@ -387,28 +403,38 @@ pub fn make_archive(
     );
 
     if build_windows {
-        let windows_files: BTreeSet<String> = all_files
-            .iter()
-            .filter(|f| include_in_windows_bundle(f))
-            .cloned()
-            .collect();
-        let output_path = out_dir.join(WINDOWS_ARCHIVE_NAME);
-        create_zip_archive(dir, &windows_files, &output_path)?;
-        println!("Wrote {}", output_path.display());
+        let windows_files = filtered_files(&all_files, include_in_windows_bundle);
+        let output_path = out_dir.join(game_archive_asset_name(WINDOWS_PLATFORM, version)?);
+        finish_archive(dir, &windows_files, &output_path, create_zip_archive)?;
     }
 
     if build_linux {
-        let linux_files: BTreeSet<String> = all_files
-            .iter()
-            .filter(|f| include_in_linux_bundle(f))
-            .cloned()
-            .collect();
-        let output_path = out_dir.join(LINUX_ARCHIVE_NAME);
-        create_tar_gz_archive(dir, &linux_files, &output_path)?;
-        println!("Wrote {}", output_path.display());
+        let linux_files = filtered_files(&all_files, include_in_linux_bundle);
+        let output_path = out_dir.join(game_archive_asset_name(LINUX_PLATFORM, version)?);
+        finish_archive(dir, &linux_files, &output_path, create_tar_gz_archive)?;
     }
 
     Ok(())
+}
+
+fn finish_archive(
+    root: &Path,
+    files: &BTreeSet<String>,
+    output_path: &Path,
+    create_archive: fn(&Path, &BTreeSet<String>, &Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !files.is_empty(),
+        "refusing to create an empty archive {}",
+        output_path.display()
+    );
+    create_archive(root, files, output_path)?;
+    println!("Wrote {}", output_path.display());
+    write_content_hash(output_path, &archive_content_hash(output_path)?)
+}
+
+fn filtered_files(files: &BTreeSet<String>, include: impl Fn(&str) -> bool) -> BTreeSet<String> {
+    files.iter().filter(|path| include(path)).cloned().collect()
 }
 
 fn create_zip_archive(
@@ -459,4 +485,83 @@ fn create_tar_gz_archive(
         .finish()
         .context("failed to finish gz compression")?;
     Ok(())
+}
+
+fn write_content_hash(archive_path: &Path, content_hash: &str) -> anyhow::Result<()> {
+    let archive_name = archive_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid archive path {}", archive_path.display()))?;
+    let sidecar_path = archive_path.with_file_name(format!("{archive_name}.content-hash"));
+    std::fs::write(&sidecar_path, format!("{content_hash}\n"))
+        .with_context(|| format!("failed to write {}", sidecar_path.display()))?;
+    println!("Wrote {}", sidecar_path.display());
+    Ok(())
+}
+
+fn archive_content_hash(archive_path: &Path) -> anyhow::Result<String> {
+    let temp_dir =
+        tempfile::tempdir().context("failed to create archive verification directory")?;
+    if archive_path
+        .extension()
+        .is_some_and(|extension| extension == "zip")
+    {
+        extract_zip(archive_path, temp_dir.path())?;
+    } else {
+        extract_tar_gz(archive_path, temp_dir.path())?;
+    }
+    hash_directory(temp_dir.path())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::extract::{extract_tar_gz, extract_zip};
+    use crate::hash::hash_directory;
+    use crate::platform::{LINUX_PLATFORM, WINDOWS_PLATFORM, game_archive_asset_name};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn archive_sidecars_match_extracted_content() {
+        let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "craftmoon-archive-test-{}-{sequence}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        let assets = root.join("assets");
+        let linux_extracted = root.join("linux-extracted");
+        let windows_extracted = root.join("windows-extracted");
+        std::fs::create_dir_all(source.join("data")).unwrap();
+        std::fs::write(source.join("CraftMoon-linux.x86_64"), b"game").unwrap();
+        std::fs::write(source.join("data/content.bin"), [0, 1, 2, 3]).unwrap();
+        std::fs::write(source.join("CraftMoon.exe"), b"windows game").unwrap();
+
+        make_archive(&source, "0.5", &assets, Some(PatchPlatform::Both)).unwrap();
+        let linux_archive = game_archive_asset_name(LINUX_PLATFORM, "0.5").unwrap();
+        let windows_archive = game_archive_asset_name(WINDOWS_PLATFORM, "0.5").unwrap();
+        extract_tar_gz(assets.join(&linux_archive), &linux_extracted).unwrap();
+        extract_zip(assets.join(&windows_archive), &windows_extracted).unwrap();
+
+        let linux_sidecar =
+            std::fs::read_to_string(assets.join(format!("{linux_archive}.content-hash"))).unwrap();
+        let windows_sidecar =
+            std::fs::read_to_string(assets.join(format!("{windows_archive}.content-hash")))
+                .unwrap();
+        assert_eq!(
+            linux_sidecar.trim(),
+            hash_directory(&linux_extracted).unwrap()
+        );
+        assert_eq!(
+            windows_sidecar.trim(),
+            hash_directory(&windows_extracted).unwrap()
+        );
+        assert!(!linux_extracted.join("CraftMoon.exe").exists());
+        assert!(!windows_extracted.join("CraftMoon-linux.x86_64").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

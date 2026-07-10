@@ -88,6 +88,12 @@ pub fn extract_zip(
             continue;
         }
 
+        anyhow::ensure!(
+            entry.is_file() && !entry.is_symlink(),
+            "refusing to extract non-file ZIP entry {}",
+            entry.name()
+        );
+
         if let Some(parent) = destination.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create directory {}", parent.display()))?;

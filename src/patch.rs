@@ -10,9 +10,10 @@ use zip::ZipArchive;
 
 use crate::extract::sanitise_path;
 use crate::hash::{hash_bytes, hash_file};
-use crate::version::{InstalledVersion, VERSION_FILE_NAME};
+use crate::version::VERSION_FILE_NAME;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchIndex {
     pub from: String,
     pub to: String,
@@ -20,6 +21,7 @@ pub struct PatchIndex {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchFileEntry {
     pub op: PatchOp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,8 +54,8 @@ pub fn create_entry_name(relative_path: &str) -> String {
 pub fn apply_patch_bundle(
     patch_path: impl AsRef<Path>,
     install_dir: impl AsRef<Path>,
-    old_version: &InstalledVersion,
-) -> anyhow::Result<InstalledVersion> {
+    installed_tag: &str,
+) -> anyhow::Result<String> {
     let patch_path = patch_path.as_ref();
     let install_dir = install_dir.as_ref();
     let archive_file = File::open(patch_path)
@@ -63,19 +65,17 @@ pub fn apply_patch_bundle(
 
     let index = read_patch_index(&mut archive)?;
     anyhow::ensure!(
-        index.from == old_version.tag,
-        "patch bundle is for {} -> {}, but installed tag is {}",
+        index.from == installed_tag,
+        "patch bundle is for {} -> {}, but installed tag is {installed_tag}",
         index.from,
         index.to,
-        old_version.tag
     );
-
-    validate_patch_index_against_version(&index, old_version)?;
-
-    let mut new_files = BTreeMap::new();
     let mut pending_changes = Vec::new();
-
     for (relative_path, entry) in &index.files {
+        anyhow::ensure!(
+            relative_path != VERSION_FILE_NAME,
+            "patch bundle must not modify launcher-managed {VERSION_FILE_NAME}"
+        );
         let disk_path = safe_install_path(install_dir, relative_path)?;
 
         match entry.op {
@@ -107,12 +107,10 @@ pub fn apply_patch_bundle(
                     actual_after == expected_after,
                     "post-patch hash mismatch for {relative_path}: expected {expected_after}, got {actual_after}"
                 );
-
                 pending_changes.push(PendingPatchChange::Write {
                     path: disk_path,
                     data: patched,
                 });
-                new_files.insert(relative_path.clone(), expected_after.to_string());
             }
             PatchOp::Create => {
                 anyhow::ensure!(
@@ -128,21 +126,19 @@ pub fn apply_patch_bundle(
                     actual_hash == expected_hash,
                     "created file hash mismatch for {relative_path}: expected {expected_hash}, got {actual_hash}"
                 );
-
                 pending_changes.push(PendingPatchChange::Write {
                     path: disk_path,
                     data,
                 });
-                new_files.insert(relative_path.clone(), expected_hash.to_string());
             }
             PatchOp::Delete => {
-                if let Some(expected_before) = entry.hash_before.as_deref() {
-                    let actual_before = hash_file(&disk_path)?;
-                    anyhow::ensure!(
-                        actual_before == expected_before,
-                        "delete hash mismatch for {relative_path}: expected {expected_before}, got {actual_before}"
-                    );
-                }
+                let expected_before =
+                    required_field(entry.hash_before.as_deref(), relative_path, "hash_before")?;
+                let actual_before = hash_file(&disk_path)?;
+                anyhow::ensure!(
+                    actual_before == expected_before,
+                    "delete hash mismatch for {relative_path}: expected {expected_before}, got {actual_before}"
+                );
                 pending_changes.push(PendingPatchChange::Delete { path: disk_path });
             }
             PatchOp::Unchanged => {
@@ -152,7 +148,6 @@ pub fn apply_patch_bundle(
                     actual_hash == expected_hash,
                     "unchanged file hash mismatch for {relative_path}: expected {expected_hash}, got {actual_hash}"
                 );
-                new_files.insert(relative_path.clone(), expected_hash.to_string());
             }
         }
     }
@@ -165,7 +160,7 @@ pub fn apply_patch_bundle(
         }
     }
 
-    Ok(InstalledVersion::new(index.to, new_files))
+    Ok(index.to)
 }
 
 fn read_patch_index(archive: &mut ZipArchive<File>) -> anyhow::Result<PatchIndex> {
@@ -177,74 +172,6 @@ fn read_patch_index(archive: &mut ZipArchive<File>) -> anyhow::Result<PatchIndex
         .read_to_string(&mut index_json)
         .context("failed to read patch.index")?;
     serde_json::from_str(&index_json).context("failed to parse patch.index")
-}
-
-fn validate_patch_index_against_version(
-    index: &PatchIndex,
-    old_version: &InstalledVersion,
-) -> anyhow::Result<()> {
-    for relative_path in old_version.files.keys() {
-        anyhow::ensure!(
-            index.files.contains_key(relative_path),
-            "patch bundle does not mention previously managed file {relative_path}"
-        );
-    }
-
-    for (relative_path, entry) in &index.files {
-        sanitise_path(relative_path)?
-            .ok_or_else(|| anyhow::anyhow!("invalid patch path {relative_path}"))?;
-        anyhow::ensure!(
-            relative_path != VERSION_FILE_NAME,
-            "patch bundle must not modify launcher-managed {VERSION_FILE_NAME}"
-        );
-
-        match entry.op {
-            PatchOp::Update => {
-                let expected_before =
-                    required_field(entry.hash_before.as_deref(), relative_path, "hash_before")?;
-                let old_hash = old_version.files.get(relative_path).ok_or_else(|| {
-                    anyhow::anyhow!("patch updates {relative_path}, but it is not in version.json")
-                })?;
-                anyhow::ensure!(
-                    old_hash == expected_before,
-                    "patch hash_before for {relative_path} does not match version.json: patch {expected_before}, version.json {old_hash}"
-                );
-            }
-            PatchOp::Create => {
-                anyhow::ensure!(
-                    !old_version.files.contains_key(relative_path),
-                    "patch creates {relative_path}, but version.json already tracks it"
-                );
-            }
-            PatchOp::Delete => {
-                let old_hash = old_version.files.get(relative_path).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "patch deletes {relative_path}, but version.json does not track it"
-                    )
-                })?;
-                if let Some(expected_before) = entry.hash_before.as_deref() {
-                    anyhow::ensure!(
-                        old_hash == expected_before,
-                        "patch delete hash_before for {relative_path} does not match version.json: patch {expected_before}, version.json {old_hash}"
-                    );
-                }
-            }
-            PatchOp::Unchanged => {
-                let expected_hash = required_field(entry.hash.as_deref(), relative_path, "hash")?;
-                let old_hash = old_version.files.get(relative_path).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "patch marks {relative_path} unchanged, but it is not in version.json"
-                    )
-                })?;
-                anyhow::ensure!(
-                    old_hash == expected_hash,
-                    "patch unchanged hash for {relative_path} does not match version.json: patch {expected_hash}, version.json {old_hash}"
-                );
-            }
-        }
-    }
-
-    Ok(())
 }
 
 fn required_field<'a>(
@@ -308,4 +235,76 @@ fn write_file_atomic(path: &Path, data: &[u8]) -> anyhow::Result<()> {
         )
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+    use crate::hash::hash_directory;
+    use crate::make_patch::{PatchPlatform, make_patch};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn generated_patch_reaches_the_expected_tree() {
+        let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "craftmoon-patch-test-{}-{sequence}",
+            std::process::id()
+        ));
+        let old_dir = root.join("old");
+        let new_dir = root.join("new");
+        let install_dir = root.join("install");
+        let out_dir = root.join("patches");
+
+        std::fs::create_dir_all(old_dir.join("data")).unwrap();
+        std::fs::write(old_dir.join("CraftMoon-linux.x86_64"), b"old game").unwrap();
+        std::fs::write(old_dir.join("data/removed.bin"), b"remove me").unwrap();
+        std::fs::write(old_dir.join("data/unchanged.bin"), b"unchanged").unwrap();
+
+        std::fs::create_dir_all(new_dir.join("data")).unwrap();
+        std::fs::write(new_dir.join("CraftMoon-linux.x86_64"), b"new game").unwrap();
+        std::fs::write(new_dir.join("data/created.bin"), b"created").unwrap();
+        std::fs::write(new_dir.join("data/unchanged.bin"), b"unchanged").unwrap();
+
+        make_patch(
+            &old_dir,
+            &new_dir,
+            "0.4",
+            "0.5",
+            &out_dir,
+            PatchPlatform::Linux,
+        )
+        .unwrap();
+        std::fs::create_dir_all(install_dir.join("data")).unwrap();
+        std::fs::copy(
+            old_dir.join("CraftMoon-linux.x86_64"),
+            install_dir.join("CraftMoon-linux.x86_64"),
+        )
+        .unwrap();
+        std::fs::copy(
+            old_dir.join("data/removed.bin"),
+            install_dir.join("data/removed.bin"),
+        )
+        .unwrap();
+        std::fs::copy(
+            old_dir.join("data/unchanged.bin"),
+            install_dir.join("data/unchanged.bin"),
+        )
+        .unwrap();
+
+        let patch = out_dir.join("0.4-to-0.5-linux.patch");
+        assert_eq!(
+            apply_patch_bundle(&patch, &install_dir, "0.4").unwrap(),
+            "0.5"
+        );
+        assert_eq!(
+            hash_directory(&install_dir).unwrap(),
+            hash_directory(&new_dir).unwrap()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -9,8 +9,8 @@ use slint::Weak;
 
 mod download;
 mod extract;
-mod http;
 mod hash;
+mod http;
 mod make_patch;
 mod manifest;
 mod patch;
@@ -21,8 +21,8 @@ mod version;
 use http::http_client;
 use make_patch::{PatchPlatform, make_archive, make_patch};
 use manifest::{Manifest, fetch_manifest};
-use platform::{GAME_EXECUTABLE_NAME, LAUNCHER_EXECUTABLE_NAME, make_executable, strip_leading_v};
-use updater::{UpdateStatus, check_for_update, download_with_fallback, perform_update};
+use platform::{CURRENT_PLATFORM, GAME_EXECUTABLE_NAME, make_executable};
+use updater::{UpdateStatus, check_for_update, download_from_mirrors, perform_update};
 
 slint::include_modules!();
 
@@ -76,6 +76,10 @@ enum Commands {
         #[arg(long)]
         dir: PathBuf,
 
+        /// Game release tag, e.g. 0.5.
+        #[arg(long)]
+        version: String,
+
         /// Directory to write the archive into.
         #[arg(long)]
         out_dir: PathBuf,
@@ -106,6 +110,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::MakeArchive {
             dir,
+            version,
             out_dir,
             platform,
         }) => {
@@ -116,13 +121,14 @@ fn main() -> anyhow::Result<()> {
                 ),
                 None => None,
             };
-            make_archive(dir, out_dir, platform)?;
+            make_archive(dir, &version, out_dir, platform)?;
             return Ok(());
         }
         None => {}
     }
 
     let install_dir = install_dir()?;
+    updater::recover_install(&install_dir)?;
     std::fs::create_dir_all(&install_dir).with_context(|| {
         format!(
             "failed to create install directory {}",
@@ -158,9 +164,7 @@ fn main() -> anyhow::Result<()> {
                     let _ = ui_weak.upgrade_in_event_loop(move |ui| {
                         ui.set_progress(0.0);
                         ui.set_show_launch_button(true);
-                        ui.set_status_text(
-                            "Could not check for updates. Launch anyway?".into(),
-                        );
+                        ui.set_status_text("Could not check for updates. Launch anyway?".into());
                     });
                 } else {
                     set_error_status(&ui_weak, message);
@@ -242,20 +246,21 @@ fn install_dir() -> anyhow::Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("failed to find user data directory"))
 }
 
-fn update_launcher(client: &reqwest::blocking::Client, manifest: &Manifest, ui_weak: &Weak<AppWindow>) {
+fn update_launcher(
+    client: &reqwest::blocking::Client,
+    manifest: &Manifest,
+    ui_weak: &Weak<AppWindow>,
+) {
     set_status(ui_weak, "Checking CraftMoon Launcher for updates...");
 
-    if launcher_version_matches(&manifest.launcher_version) {
+    if !launcher_update_available(&manifest.launcher_version) {
         return;
     }
 
-    let launcher_binary = LAUNCHER_EXECUTABLE_NAME;
-    let expected_hash = match manifest.launcher_binaries.get(launcher_binary) {
-        Some(hash) => hash,
-        None => {
-            eprintln!(
-                "Manifest does not list launcher binary {launcher_binary} for this platform."
-            );
+    let launcher_asset = match manifest.launcher_binary(CURRENT_PLATFORM) {
+        Ok(asset) => asset,
+        Err(err) => {
+            eprintln!("Manifest does not provide a launcher update for this platform: {err}");
             return;
         }
     };
@@ -279,11 +284,11 @@ fn update_launcher(client: &reqwest::blocking::Client, manifest: &Manifest, ui_w
             manifest.launcher_version
         ),
     );
-    let temp = match download_with_fallback(
+    let temp = match download_from_mirrors(
         client,
         &manifest.endpoints,
-        launcher_binary,
-        expected_hash,
+        &launcher_asset.name,
+        &launcher_asset.sha256,
         &download_dir,
         &mut |downloaded, total| set_download_progress(ui_weak, downloaded, total),
     ) {
@@ -299,6 +304,8 @@ fn update_launcher(client: &reqwest::blocking::Client, manifest: &Manifest, ui_w
         return;
     }
 
+    let saved_exe = current_exe.clone();
+
     if let Err(err) = self_replace::self_replace(temp.path()) {
         eprintln!("Failed to replace current launcher executable: {err}");
         return;
@@ -306,12 +313,19 @@ fn update_launcher(client: &reqwest::blocking::Client, manifest: &Manifest, ui_w
 
     set_status(ui_weak, "Launcher updated. Restarting...");
     drop(temp);
-    restart_program();
+    restart_program(&saved_exe);
 }
 
-fn launcher_version_matches(latest_tag: &str) -> bool {
-    latest_tag == env!("CARGO_PKG_VERSION")
-        || strip_leading_v(latest_tag) == env!("CARGO_PKG_VERSION")
+fn launcher_update_available(latest_version: &str) -> bool {
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("CARGO_PKG_VERSION must be valid semver");
+    match semver::Version::parse(latest_version) {
+        Ok(latest) => latest > current,
+        Err(err) => {
+            eprintln!("Manifest has an invalid launcher version {latest_version:?}: {err}");
+            false
+        }
+    }
 }
 
 fn describe_update_status(ui_weak: &Weak<AppWindow>, manifest: &Manifest, status: &UpdateStatus) {
@@ -322,11 +336,11 @@ fn describe_update_status(ui_weak: &Weak<AppWindow>, manifest: &Manifest, status
                 format!("CraftMoon {} is available.", manifest.game_version),
             );
         }
-        UpdateStatus::CorruptInstall => {
+        UpdateStatus::ReinstallRequired => {
             set_status(
                 ui_weak,
                 format!(
-                    "CraftMoon install is corrupted; latest is {}.",
+                    "CraftMoon install differs from the published {} release.",
                     manifest.game_version
                 ),
             );
@@ -386,19 +400,15 @@ fn launch_game(game_path: PathBuf) {
     }
 }
 
-fn restart_program() {
-    let current_exe = match std::env::current_exe() {
-        Ok(current_exe) => current_exe,
-        Err(err) => {
-            eprintln!("failed to get current exe path: {err}");
-            return;
-        }
-    };
-    if let Err(err) = std::process::Command::new(current_exe)
+fn restart_program(exe_path: &std::path::Path) {
+    if let Err(err) = std::process::Command::new(exe_path)
         .arg("--no-self-update")
         .spawn()
     {
-        eprintln!("Failed to restart launcher: {err}");
+        eprintln!(
+            "Failed to restart launcher at {}: {err}",
+            exe_path.display()
+        );
         std::process::exit(1);
     } else {
         std::process::exit(0);
